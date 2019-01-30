@@ -89,6 +89,7 @@ void pwm_ready_callback(uint32_t pwm_id)    // PWM callback function
 {
     ready_flag = true;
 }
+const nrf_drv_timer_t TIMER_LED = NRF_DRV_TIMER_INSTANCE(0);
 
 /* Configure switch debounce timeout for EnOcean switch here */
 #define SWITCH_DEBOUNCE_INTERVAL_US (MS_TO_US(500))
@@ -185,6 +186,34 @@ static void rx_callback(const nrf_mesh_adv_packet_rx_data_t * p_rx_data)
     enocean_packet_process(p_rx_data);
 }
 
+
+
+/**
+ * @brief Handler for timer events.
+ */
+#define LED_ACTION_DIM 0
+#define LED_ACTION_UNDIM 1
+static int ledTimerAction;
+static uint32_t curLedBrightness;
+void timer_led_event_handler(nrf_timer_event_t event_type, void* p_context)
+{
+    switch (ledTimerAction)
+    {
+        case LED_ACTION_DIM:
+            curLedBrightness--;
+            break;
+        case LED_ACTION_UNDIM:
+            curLedBrightness++;
+            break;
+
+        default:
+            //Do nothing.
+            break;
+    }
+    while (app_pwm_channel_duty_set(&PWM1, 0, curLedBrightness) == NRF_ERROR_BUSY)
+       ;
+}
+
 static void app_switch_debounce(enocean_switch_status_t * p_status, uint8_t index)
 {
     uint32_t timestamp = timer_now();
@@ -197,17 +226,24 @@ static void app_switch_debounce(enocean_switch_status_t * p_status, uint8_t inde
     transition_params.delay_ms = APP_CONFIG_ONOFF_DELAY_MS;
     transition_params.transition_time_ms = APP_CONFIG_ONOFF_TRANSITION_TIME_MS;
 
-    // Task 3 (I misunderstood task):
+    // Task 3
     if (p_status->action == PRESS_ACTION)
     {
-       // store timestamp
-       if (p_status->b0)
+        if (p_status->b0)
        {
-          m_switch_state[index].b0_ts = timestamp;
+          curLedBrightness = 100;
+
+          ledTimerAction = LED_ACTION_DIM;
+          // start timer to dim LED
+          nrf_drv_timer_enable(&TIMER_LED);
        }
        else if (p_status->b1)
        {
-          m_switch_state[index].b1_ts = timestamp;
+          curLedBrightness = 0;
+
+          ledTimerAction = LED_ACTION_UNDIM;
+          // start timer to undim LED
+          nrf_drv_timer_enable(&TIMER_LED);
        }
     }
 
@@ -215,35 +251,26 @@ static void app_switch_debounce(enocean_switch_status_t * p_status, uint8_t inde
     {
        if (p_status->b0)
        {
+          // cancel timer
+          nrf_drv_timer_enable(&TIMER_LED);
           if (timestamp - m_switch_state[index].b0_ts < LONG_PRESS_INTERVAL_US)
           {
              // Short press: Turn on LED (full brightness)
              while (app_pwm_channel_duty_set(&PWM1, 0, 100) == NRF_ERROR_BUSY)
                ;
           }
-          else
-          {
-             // Long press: Dim LED (25% brightness)
-             while (app_pwm_channel_duty_set(&PWM1, 0, 25) == NRF_ERROR_BUSY)
-               ;
-          }
-          m_switch_state[index].b0_ts = 0;
        }
        else if (p_status->b1)
        {
+          // cancel timer
+          nrf_drv_timer_enable(&TIMER_LED);
+
           if (timestamp - m_switch_state[index].b1_ts < LONG_PRESS_INTERVAL_US)
           {
              // Short press: Turn off LED
              while (app_pwm_channel_duty_set(&PWM1, 0, 0) == NRF_ERROR_BUSY)
                ;
           }
-          else
-          {
-             // Long press: Undim (turn on) LED (100% brightness)
-             while (app_pwm_channel_duty_set(&PWM1, 0, 100) == NRF_ERROR_BUSY)
-               ;
-          }
-          m_switch_state[index].b1_ts = 0;
        }
     }
 
@@ -699,6 +726,18 @@ int main(void)
     err_code = app_pwm_init(&PWM1,&pwm1_cfg,pwm_ready_callback);
     APP_ERROR_CHECK(err_code);
     app_pwm_enable(&PWM1);
+
+    uint32_t time_ms = 100; //Time(in miliseconds) between consecutive compare events.
+    uint32_t time_ticks;
+    uint32_t err_code = NRF_SUCCESS;
+    nrf_drv_timer_config_t timer_cfg = NRF_DRV_TIMER_DEFAULT_CONFIG;
+    err_code = nrf_drv_timer_init(&TIMER_LED, &timer_cfg, timer_led_event_handler);
+    APP_ERROR_CHECK(err_code);
+
+    time_ticks = nrf_drv_timer_ms_to_ticks(&TIMER_LED, time_ms);
+
+    nrf_drv_timer_extended_compare(
+         &TIMER_LED, NRF_TIMER_CC_CHANNEL0, time_ticks, NRF_TIMER_SHORT_COMPARE0_CLEAR_MASK, true);
 
     for (;;)
     {
