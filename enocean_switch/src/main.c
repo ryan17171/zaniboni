@@ -244,6 +244,55 @@ static void app_switch_debounce(enocean_switch_status_t * p_status, uint8_t inde
             __LOG(LOG_SRC_APP, LOG_LEVEL_INFO, "Sending msg: Client[1]: ONOFF SET %d\n", set_params.on_off);
         }
     }
+    if (p_status->action == RELEASE_ACTION)
+    {
+        /* Change state on the unicast server address using 1st on/off client */
+        if (p_status->a0 && timer_diff(timestamp, m_switch_state[index].a0_ts) > SWITCH_DEBOUNCE_INTERVAL_US)
+        {
+            m_switch_state[index].a0_ts = timestamp;
+            set_params.on_off = APP_STATE_ON;
+            hal_led_pin_set(BSP_LED_0, set_params.on_off);
+            status = generic_onoff_client_set(&m_clients[0], &set_params, &transition_params);
+        }
+        else if (p_status->a1 && timer_diff(timestamp, m_switch_state[index].a1_ts) > SWITCH_DEBOUNCE_INTERVAL_US)
+        {
+            m_switch_state[index].a1_ts = timestamp;
+            set_params.on_off = APP_STATE_OFF;
+            hal_led_pin_set(BSP_LED_0, set_params.on_off);
+            status = generic_onoff_client_set(&m_clients[0], &set_params, &transition_params);
+        }
+
+        if (status == NRF_SUCCESS)
+        {
+            __LOG(LOG_SRC_APP, LOG_LEVEL_INFO, "Sending msg: Client[0]: ONOFF SET %d\n", set_params.on_off);
+        }
+        status = NRF_ERROR_INTERNAL;
+
+        /* Change state on the nodes subscribed to the Odd group address using 2nd on/off client */
+        if (p_status->b0 && timer_diff(timestamp, m_switch_state[index].b0_ts) > SWITCH_DEBOUNCE_INTERVAL_US)
+        {
+            while (app_pwm_channel_duty_set(&PWM1, 0, 75) == NRF_ERROR_BUSY)
+              ;
+            m_switch_state[index].b0_ts = timestamp;
+            set_params.on_off = APP_STATE_ON;
+            //hal_led_pin_set(BSP_LED_1, set_params.on_off);
+            status = generic_onoff_client_set_unack(&m_clients[1], &set_params, &transition_params, APP_UNACK_MSG_REPEAT_COUNT);
+        }
+        else if (p_status->b1 && timer_diff(timestamp, m_switch_state[index].b1_ts) > SWITCH_DEBOUNCE_INTERVAL_US)
+        {
+            while (app_pwm_channel_duty_set(&PWM1, 0, 100) == NRF_ERROR_BUSY)
+              ;
+            m_switch_state[index].b1_ts = timestamp;
+            set_params.on_off = APP_STATE_OFF;
+            //hal_led_pin_set(BSP_LED_1, set_params.on_off);
+            status = generic_onoff_client_set_unack(&m_clients[1], &set_params, &transition_params, APP_UNACK_MSG_REPEAT_COUNT);
+        }
+
+        if (status == NRF_SUCCESS)
+        {
+            __LOG(LOG_SRC_APP, LOG_LEVEL_INFO, "Sending msg: Client[1]: ONOFF SET %d\n", set_params.on_off);
+        }
+    }
 }
 
 /* This example translates the messages from the PTM215B switches to on/off client model messages.
