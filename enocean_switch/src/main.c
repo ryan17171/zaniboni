@@ -102,6 +102,8 @@ void pwm_ready_callback(uint32_t pwm_id)    // PWM callback function
 
 #define LIGHT_SWITCH_CLIENTS          (PTM215B_NUMBER_OF_SWITCHES/2)
 
+#define LONG_PRESS_INTERVAL_US        (MS_TO_US(3000))
+
 typedef struct
 {
     uint32_t a0_ts;
@@ -195,6 +197,59 @@ static void app_switch_debounce(enocean_switch_status_t * p_status, uint8_t inde
     transition_params.delay_ms = APP_CONFIG_ONOFF_DELAY_MS;
     transition_params.transition_time_ms = APP_CONFIG_ONOFF_TRANSITION_TIME_MS;
 
+    // Task 3 (I misunderstood task):
+    if (p_status->action == PRESS_ACTION)
+    {
+       // store timestamp
+       if (p_status->b0)
+       {
+          m_switch_state[index].b0_ts = timestamp;
+       }
+       else if (p_status->b1)
+       {
+          m_switch_state[index].b1_ts = timestamp;
+       }
+    }
+
+    if (p_status->action == RELEASE_ACTION)
+    {
+       if (p_status->b0)
+       {
+          if (timestamp - m_switch_state[index].b0_ts < LONG_PRESS_INTERVAL_US)
+          {
+             // Short press: Turn on LED (full brightness)
+             while (app_pwm_channel_duty_set(&PWM1, 0, 100) == NRF_ERROR_BUSY)
+               ;
+          }
+          else
+          {
+             // Long press: Dim LED (25% brightness)
+             while (app_pwm_channel_duty_set(&PWM1, 0, 25) == NRF_ERROR_BUSY)
+               ;
+          }
+          m_switch_state[index].b0_ts = 0;
+       }
+       else if (p_status->b1)
+       {
+          if (timestamp - m_switch_state[index].b1_ts < LONG_PRESS_INTERVAL_US)
+          {
+             // Short press: Turn off LED
+             while (app_pwm_channel_duty_set(&PWM1, 0, 0) == NRF_ERROR_BUSY)
+               ;
+          }
+          else
+          {
+             // Long press: Undim (turn on) LED (100% brightness)
+             while (app_pwm_channel_duty_set(&PWM1, 0, 100) == NRF_ERROR_BUSY)
+               ;
+          }
+          m_switch_state[index].b1_ts = 0;
+       }
+    }
+
+
+#if 0
+    // Task 1, 2
     if (p_status->action == PRESS_ACTION)
     {
         /* Change state on the unicast server address using 1st on/off client */
@@ -293,6 +348,7 @@ static void app_switch_debounce(enocean_switch_status_t * p_status, uint8_t inde
             __LOG(LOG_SRC_APP, LOG_LEVEL_INFO, "Sending msg: Client[1]: ONOFF SET %d\n", set_params.on_off);
         }
     }
+#endif
 }
 
 /* This example translates the messages from the PTM215B switches to on/off client model messages.
