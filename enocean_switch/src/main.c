@@ -81,15 +81,8 @@
 #include "app_pwm.h"
 #include "nrf_drv_ppi.h"
 
-APP_PWM_INSTANCE(PWM1,1);                   // Create the instance "PWM1" using TIMER1.
 
-static volatile bool ready_flag;            // A flag indicating PWM status.
-
-void pwm_ready_callback(uint32_t pwm_id)    // PWM callback function
-{
-    ready_flag = true;
-}
-const nrf_drv_timer_t TIMER_LED = NRF_DRV_TIMER_INSTANCE(0);
+APP_TIMER_DEF(TIMER_UPTIME);
 
 /* Configure switch debounce timeout for EnOcean switch here */
 #define SWITCH_DEBOUNCE_INTERVAL_US (MS_TO_US(500))
@@ -103,7 +96,9 @@ const nrf_drv_timer_t TIMER_LED = NRF_DRV_TIMER_INSTANCE(0);
 
 #define LIGHT_SWITCH_CLIENTS          (PTM215B_NUMBER_OF_SWITCHES/2)
 
-#define LONG_PRESS_INTERVAL_US        (MS_TO_US(3000))
+#define UPTIME_TIMER_DUR_MS           (1000)
+
+#define NUM_UPTIME_RECS               5
 
 typedef struct
 {
@@ -117,7 +112,20 @@ typedef struct
 static generic_onoff_client_t m_clients[LIGHT_SWITCH_CLIENTS];
 static bool m_device_provisioned;
 
-static app_secmat_flash_t m_app_secmat_flash[MAX_ENOCEAN_DEVICES_SUPPORTED];
+// Add uptime buffer index to existing flash structure to keep from rewriting
+typedef struct
+{
+    app_secmat_flash_t secmat;
+
+    struct
+    {
+        int16_t curBufIndex;
+        int16_t tbl[NUM_UPTIME_RECS];
+    } upTime;
+} app_flash_t;
+
+static app_flash_t m_app_flash[MAX_ENOCEAN_DEVICES_SUPPORTED];
+
 static enocean_commissioning_secmat_t m_app_secmat[MAX_ENOCEAN_DEVICES_SUPPORTED];
 static uint8_t  m_enocean_dev_cnt;
 static app_switch_debounce_state_t m_switch_state[MAX_ENOCEAN_DEVICES_SUPPORTED];
@@ -145,10 +153,10 @@ const generic_onoff_client_callbacks_t client_cbs =
 /* Try to store app data. If busy, ask user to manually initiate operation. */
 static void app_data_store_try(void)
 {
-    uint32_t status = app_flash_data_store(APP_DATA_ENTRY_HANDLE, &m_app_secmat_flash[0], sizeof(m_app_secmat_flash));
+    uint32_t status = app_flash_data_store(APP_DATA_ENTRY_HANDLE, &m_app_flash[0], sizeof(m_app_flash));
     if (status == NRF_SUCCESS)
     {
-        __LOG(LOG_SRC_APP, LOG_LEVEL_INFO, "Storing: Enocean security material\n");
+//        __LOG(LOG_SRC_APP, LOG_LEVEL_INFO, "Storing: Enocean security material\n");
     }
     else if (status == NRF_ERROR_NOT_SUPPORTED)
     {
@@ -159,6 +167,7 @@ static void app_data_store_try(void)
         __LOG(LOG_SRC_APP, LOG_LEVEL_ERROR, "Flash busy. Cannot store. Press Button 2 to try again. \n");
     }
 }
+
 
 static uint8_t enocean_device_index_get(enocean_evt_t * p_evt)
 {
@@ -187,31 +196,13 @@ static void rx_callback(const nrf_mesh_adv_packet_rx_data_t * p_rx_data)
 }
 
 
-
+volatile int writeFlash;
 /**
  * @brief Handler for timer events.
  */
-#define LED_ACTION_DIM 0
-#define LED_ACTION_UNDIM 1
-static int ledTimerAction;
-static uint32_t curLedBrightness;
-void timer_led_event_handler(nrf_timer_event_t event_type, void* p_context)
+void timer_uptime_handler(void* p_context)
 {
-    switch (ledTimerAction)
-    {
-        case LED_ACTION_DIM:
-            curLedBrightness--;
-            break;
-        case LED_ACTION_UNDIM:
-            curLedBrightness++;
-            break;
-
-        default:
-            //Do nothing.
-            break;
-    }
-    while (app_pwm_channel_duty_set(&PWM1, 0, curLedBrightness) == NRF_ERROR_BUSY)
-       ;
+    writeFlash = 1;
 }
 
 static void app_switch_debounce(enocean_switch_status_t * p_status, uint8_t index)
@@ -226,57 +217,6 @@ static void app_switch_debounce(enocean_switch_status_t * p_status, uint8_t inde
     transition_params.delay_ms = APP_CONFIG_ONOFF_DELAY_MS;
     transition_params.transition_time_ms = APP_CONFIG_ONOFF_TRANSITION_TIME_MS;
 
-    // Task 3
-    if (p_status->action == PRESS_ACTION)
-    {
-        if (p_status->b0)
-       {
-          curLedBrightness = 100;
-
-          ledTimerAction = LED_ACTION_DIM;
-          // start timer to dim LED
-          nrf_drv_timer_enable(&TIMER_LED);
-       }
-       else if (p_status->b1)
-       {
-          curLedBrightness = 0;
-
-          ledTimerAction = LED_ACTION_UNDIM;
-          // start timer to undim LED
-          nrf_drv_timer_enable(&TIMER_LED);
-       }
-    }
-
-    if (p_status->action == RELEASE_ACTION)
-    {
-       if (p_status->b0)
-       {
-          // cancel timer
-          nrf_drv_timer_enable(&TIMER_LED);
-          if (timestamp - m_switch_state[index].b0_ts < LONG_PRESS_INTERVAL_US)
-          {
-             // Short press: Turn on LED (full brightness)
-             while (app_pwm_channel_duty_set(&PWM1, 0, 100) == NRF_ERROR_BUSY)
-               ;
-          }
-       }
-       else if (p_status->b1)
-       {
-          // cancel timer
-          nrf_drv_timer_enable(&TIMER_LED);
-
-          if (timestamp - m_switch_state[index].b1_ts < LONG_PRESS_INTERVAL_US)
-          {
-             // Short press: Turn off LED
-             while (app_pwm_channel_duty_set(&PWM1, 0, 0) == NRF_ERROR_BUSY)
-               ;
-          }
-       }
-    }
-
-
-#if 0
-    // Task 1, 2
     if (p_status->action == PRESS_ACTION)
     {
         /* Change state on the unicast server address using 1st on/off client */
@@ -304,8 +244,8 @@ static void app_switch_debounce(enocean_switch_status_t * p_status, uint8_t inde
         /* Change state on the nodes subscribed to the Odd group address using 2nd on/off client */
         if (p_status->b0 && timer_diff(timestamp, m_switch_state[index].b0_ts) > SWITCH_DEBOUNCE_INTERVAL_US)
         {
-            while (app_pwm_channel_duty_set(&PWM1, 0, 25) == NRF_ERROR_BUSY)
-              ;
+//          while (app_pwm_channel_duty_set(&PWM1, 0, 25) == NRF_ERROR_BUSY)
+//              ;
             m_switch_state[index].b0_ts = timestamp;
             set_params.on_off = APP_STATE_ON;
             //hal_led_pin_set(BSP_LED_1, set_params.on_off);
@@ -313,8 +253,8 @@ static void app_switch_debounce(enocean_switch_status_t * p_status, uint8_t inde
         }
         else if (p_status->b1 && timer_diff(timestamp, m_switch_state[index].b1_ts) > SWITCH_DEBOUNCE_INTERVAL_US)
         {
-            while (app_pwm_channel_duty_set(&PWM1, 0, 50) == NRF_ERROR_BUSY)
-              ;
+//            while (app_pwm_channel_duty_set(&PWM1, 0, 50) == NRF_ERROR_BUSY)
+//              ;
             m_switch_state[index].b1_ts = timestamp;
             set_params.on_off = APP_STATE_OFF;
             //hal_led_pin_set(BSP_LED_1, set_params.on_off);
@@ -353,8 +293,11 @@ static void app_switch_debounce(enocean_switch_status_t * p_status, uint8_t inde
         /* Change state on the nodes subscribed to the Odd group address using 2nd on/off client */
         if (p_status->b0 && timer_diff(timestamp, m_switch_state[index].b0_ts) > SWITCH_DEBOUNCE_INTERVAL_US)
         {
-            while (app_pwm_channel_duty_set(&PWM1, 0, 75) == NRF_ERROR_BUSY)
-              ;
+              __LOG(LOG_SRC_APP, LOG_LEVEL_INFO, "Resetting flash\n");
+              memset (&m_app_flash[0], 0, sizeof(m_app_flash)); // reset on button release
+
+//            while (app_pwm_channel_duty_set(&PWM1, 0, 75) == NRF_ERROR_BUSY)
+//              ;
             m_switch_state[index].b0_ts = timestamp;
             set_params.on_off = APP_STATE_ON;
             //hal_led_pin_set(BSP_LED_1, set_params.on_off);
@@ -362,8 +305,8 @@ static void app_switch_debounce(enocean_switch_status_t * p_status, uint8_t inde
         }
         else if (p_status->b1 && timer_diff(timestamp, m_switch_state[index].b1_ts) > SWITCH_DEBOUNCE_INTERVAL_US)
         {
-            while (app_pwm_channel_duty_set(&PWM1, 0, 100) == NRF_ERROR_BUSY)
-              ;
+//            while (app_pwm_channel_duty_set(&PWM1, 0, 100) == NRF_ERROR_BUSY)
+//              ;
             m_switch_state[index].b1_ts = timestamp;
             set_params.on_off = APP_STATE_OFF;
             //hal_led_pin_set(BSP_LED_1, set_params.on_off);
@@ -375,7 +318,6 @@ static void app_switch_debounce(enocean_switch_status_t * p_status, uint8_t inde
             __LOG(LOG_SRC_APP, LOG_LEVEL_INFO, "Sending msg: Client[1]: ONOFF SET %d\n", set_params.on_off);
         }
     }
-#endif
 }
 
 /* This example translates the messages from the PTM215B switches to on/off client model messages.
@@ -404,17 +346,17 @@ static void app_enocean_cb(enocean_evt_t * p_evt)
     {
         if (m_enocean_dev_cnt < MAX_ENOCEAN_DEVICES_SUPPORTED)
         {
-            m_app_secmat_flash[m_enocean_dev_cnt].seq = p_evt->params.secmat.seq;
-            memcpy(&m_app_secmat_flash[m_enocean_dev_cnt].ble_gap_addr[0],
+            m_app_flash[m_enocean_dev_cnt].secmat.seq = p_evt->params.secmat.seq;
+            memcpy(&m_app_flash[m_enocean_dev_cnt].secmat.ble_gap_addr[0],
                    p_evt->p_ble_gap_addr, BLE_GAP_ADDR_LEN);
-            memcpy(&m_app_secmat_flash[m_enocean_dev_cnt].key[0],
+            memcpy(&m_app_flash[m_enocean_dev_cnt].secmat.key[0],
                    p_evt->params.secmat.p_key, PTM215B_COMM_PACKET_KEY_SIZE);
 
             app_data_store_try();
 
-            m_app_secmat[m_enocean_dev_cnt].p_seq =  &m_app_secmat_flash[m_enocean_dev_cnt].seq;
-            m_app_secmat[m_enocean_dev_cnt].p_ble_gap_addr = &m_app_secmat_flash[m_enocean_dev_cnt].ble_gap_addr[0];
-            m_app_secmat[m_enocean_dev_cnt].p_key = &m_app_secmat_flash[m_enocean_dev_cnt].key[0];
+            m_app_secmat[m_enocean_dev_cnt].p_seq =  &m_app_flash[m_enocean_dev_cnt].secmat.seq;
+            m_app_secmat[m_enocean_dev_cnt].p_ble_gap_addr = &m_app_flash[m_enocean_dev_cnt].secmat.ble_gap_addr[0];
+            m_app_secmat[m_enocean_dev_cnt].p_key = &m_app_flash[m_enocean_dev_cnt].secmat.key[0];
             enocean_secmat_add(&m_app_secmat[m_enocean_dev_cnt]);
 
             m_enocean_dev_cnt++;
@@ -519,7 +461,7 @@ static void button_event_handler(uint32_t button_number)
 #if MESH_FEATURE_GATT_PROXY_ENABLED
             (void) proxy_stop();
 #endif
-            app_flash_clear(&m_app_secmat_flash[0], sizeof(m_app_secmat_flash));
+            app_flash_clear(&m_app_flash[0], sizeof(m_app_flash));
             mesh_stack_config_clear();
             node_reset();
             break;
@@ -659,17 +601,21 @@ static void app_start(void)
     __LOG(LOG_SRC_APP, LOG_LEVEL_INFO, "Starting application \n");
 
     /* Load app specific data */
-    if (app_flash_data_load(APP_DATA_ENTRY_HANDLE, &m_app_secmat_flash[0], sizeof(m_app_secmat_flash)) == NRF_SUCCESS)
+    if (app_flash_data_load(APP_DATA_ENTRY_HANDLE, &m_app_flash[0], sizeof(m_app_flash)) == NRF_SUCCESS)
     {
+        __LOG(LOG_SRC_APP, LOG_LEVEL_INFO, "Flash successfully loaded\n");
+    /*
+        This is crashing, so comment it out for now.
         for (uint8_t i = 0; i < MAX_ENOCEAN_DEVICES_SUPPORTED; i++)
         {
-            m_app_secmat[i].p_ble_gap_addr = &m_app_secmat_flash[i].ble_gap_addr[0];
-            m_app_secmat[i].p_key = &m_app_secmat_flash[i].key[0];
-            m_app_secmat[i].p_seq = &m_app_secmat_flash[i].seq;
+            m_app_secmat[i].p_ble_gap_addr = &m_app_flash[i].secmat.ble_gap_addr[0];
+            m_app_secmat[i].p_key = &m_app_flash[i].secmat.key[0];
+            m_app_secmat[i].p_seq = &m_app_flash[i].secmat.seq;
             m_enocean_dev_cnt++;
             enocean_secmat_add(&m_app_secmat[i]);
             __LOG(LOG_SRC_APP, LOG_LEVEL_INFO, "Restored: Enocean security materials\n");
         }
+    */
     }
     else
     {
@@ -679,6 +625,50 @@ static void app_start(void)
     /* Install rx callback to intercept incoming ADV packets so that they can be passed to the
     EnOcean packet processor */
     nrf_mesh_rx_cb_set(rx_callback);
+
+
+//    __LOG(LOG_SRC_APP, LOG_LEVEL_INFO, "CurBufIndex: %d\n", m_app_flash[0].upTime.curBufIndex);
+
+
+    if ((m_app_flash[0].upTime.curBufIndex < 0) ||
+          (m_app_flash[0].upTime.curBufIndex >= NUM_UPTIME_RECS))
+    {
+       __LOG(LOG_SRC_APP, LOG_LEVEL_INFO, "Initializing index from %d\n",
+            m_app_flash[0].upTime.curBufIndex);
+       m_app_flash[0].upTime.curBufIndex = 0; // Initialize
+    }
+    uint32_t bufIndex = (m_app_flash[0].upTime.curBufIndex + 1) % NUM_UPTIME_RECS;
+
+    uint32_t printCount = 0;
+    for (uint32_t i = 0; i < NUM_UPTIME_RECS; i++,
+        bufIndex = (bufIndex + 1) % NUM_UPTIME_RECS)
+    {
+        if (m_app_flash[0].upTime.tbl[bufIndex] <= 0)  // Try to detect invalid value
+        {
+//            __LOG(LOG_SRC_APP, LOG_LEVEL_INFO, "Skipping %d: %d\n", bufIndex,
+//                m_app_flash[0].upTime.tbl[bufIndex]);
+            continue;
+        }
+        __LOG(LOG_SRC_APP, LOG_LEVEL_INFO, "UpTime[%d]: %d\n", NUM_UPTIME_RECS - printCount,
+                m_app_flash[0].upTime.tbl[bufIndex]);
+        printCount++;
+    }
+
+    __LOG(LOG_SRC_APP, LOG_LEVEL_INFO, "CurBufIndex: %d -> %d\n",
+        m_app_flash[0].upTime.curBufIndex,
+        (m_app_flash[0].upTime.curBufIndex + 1) % NUM_UPTIME_RECS);
+    m_app_flash[0].upTime.curBufIndex = (m_app_flash[0].upTime.curBufIndex + 1) % NUM_UPTIME_RECS;
+
+    uint32_t err_code;
+    err_code = app_timer_create(&TIMER_UPTIME,
+                                APP_TIMER_MODE_REPEATED,
+                                timer_uptime_handler);
+    APP_ERROR_CHECK(err_code);
+
+    err_code = app_timer_start(TIMER_UPTIME,
+                               APP_TIMER_TICKS(UPTIME_TIMER_DUR_MS),
+                               NULL);
+    APP_ERROR_CHECK(err_code);
 }
 
 static void start(void)
@@ -718,29 +708,20 @@ int main(void)
     initialize();
     start();
 
-    ret_code_t err_code;
-
-    app_pwm_config_t pwm1_cfg = APP_PWM_DEFAULT_CONFIG_1CH(1000L, BSP_LED_0);
-
-    /* Initialize and enable PWM. */
-    err_code = app_pwm_init(&PWM1,&pwm1_cfg,pwm_ready_callback);
-    APP_ERROR_CHECK(err_code);
-    app_pwm_enable(&PWM1);
-
-    uint32_t time_ms = 100; //Time(in miliseconds) between consecutive compare events.
-    uint32_t time_ticks;
-    uint32_t err_code = NRF_SUCCESS;
-    nrf_drv_timer_config_t timer_cfg = NRF_DRV_TIMER_DEFAULT_CONFIG;
-    err_code = nrf_drv_timer_init(&TIMER_LED, &timer_cfg, timer_led_event_handler);
-    APP_ERROR_CHECK(err_code);
-
-    time_ticks = nrf_drv_timer_ms_to_ticks(&TIMER_LED, time_ms);
-
-    nrf_drv_timer_extended_compare(
-         &TIMER_LED, NRF_TIMER_CC_CHANNEL0, time_ticks, NRF_TIMER_SHORT_COMPARE0_CLEAR_MASK, true);
-
     for (;;)
     {
         (void)sd_app_evt_wait();
+
+        if (writeFlash)
+        {
+            // Record uptime in seconds (uS / 1000000)
+            m_app_flash[0].upTime.tbl[m_app_flash[0].upTime.curBufIndex] = timer_now() / 1000000;
+/*            __LOG(LOG_SRC_APP, LOG_LEVEL_INFO, "Writing flash: %d\n",
+                    m_app_flash[0].upTime.curBufIndex);
+*/
+            app_data_store_try();
+            writeFlash = 0;
+        }
     }
 }
+
